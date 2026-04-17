@@ -23,6 +23,9 @@
  *   CRAFT_WEBUI_WS_URL         — optional browser-facing ws:// or wss:// URL returned by /api/config
  *   CRAFT_MESSAGING_WA_WORKER  — absolute path to worker.cjs (default: packages/messaging-whatsapp-worker/dist/worker.cjs)
  *   CRAFT_MESSAGING_NODE_BIN   — Node binary used to spawn the WhatsApp worker (default: node)
+ *   GOOGLE_CLIENT_ID           — Google OAuth client ID (enables Google SSO)
+ *   GOOGLE_CLIENT_SECRET       — Google OAuth client secret (required with client ID)
+ *   GOOGLE_ALLOWED_DOMAIN      — optional Google Workspace domain restriction (e.g., 'clearbridge.ca')
  */
 
 import { join } from 'node:path'
@@ -118,6 +121,19 @@ const webuiSecureCookies = parseOptionalBooleanEnv('CRAFT_WEBUI_SECURE_COOKIE', 
 const webuiWsUrl = parseOptionalWebSocketUrl('CRAFT_WEBUI_WS_URL', process.env.CRAFT_WEBUI_WS_URL)
 const serverToken = process.env.CRAFT_SERVER_TOKEN
 
+// Google OAuth configuration
+const googleClientId = process.env.GOOGLE_CLIENT_ID
+const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET
+const googleAllowedDomain = process.env.GOOGLE_ALLOWED_DOMAIN
+const googleAuthConfig = googleClientId && googleClientSecret
+  ? {
+      clientId: googleClientId,
+      clientSecret: googleClientSecret,
+      redirectUri: '', // computed per-request in http-server.ts
+      ...(googleAllowedDomain ? { allowedDomain: googleAllowedDomain } : {}),
+    }
+  : undefined
+
 // ---------------------------------------------------------------------------
 // Create WebUI handler early so it can be embedded in the WsRpcServer.
 // The handler is a pure function — it doesn't need the session manager yet
@@ -146,6 +162,7 @@ if (webuiEnabled && serverToken) {
     wsPort: rpcPort,
     getHealthCheck: () => healthCheckFn?.() ?? { status: 'starting' },
     logger: { info: console.log, warn: console.warn, error: console.error } as any,
+    googleAuthConfig,
   })
 
   webuiNodeHandler = nodeHttpAdapter(webuiHandler.fetch)

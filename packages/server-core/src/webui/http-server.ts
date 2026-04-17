@@ -16,11 +16,21 @@ import {
   initPasswordHash,
   verifyPassword,
   createSessionToken,
+  createUserSessionToken,
   validateSession,
   buildSessionCookie,
   buildLogoutCookie,
 } from './auth'
+import {
+  generateAuthUrl,
+  exchangeCodeForTokens,
+  verifyIdToken,
+  validateDomain,
+  GoogleAuthFlowStore,
+  type GoogleAuthConfig,
+} from './google-auth'
 import { generateCallbackPage } from '@craft-agent/shared/auth'
+import { getDatabase, UserRepository } from '@craft-agent/shared/database'
 import type { PlatformServices } from '../runtime/platform'
 
 // ---------------------------------------------------------------------------
@@ -145,6 +155,8 @@ export interface WebuiHandlerOptions {
    * and 'direct' is used as the rate-limit key.
    */
   trustedProxies?: string[]
+  /** Google OAuth configuration. When provided, enables Google SSO routes. */
+  googleAuthConfig?: GoogleAuthConfig
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +190,7 @@ export function createWebuiHandler(options: WebuiHandlerOptions): WebuiHandler {
     getHealthCheck,
     logger,
     trustedProxies,
+    googleAuthConfig,
   } = options
 
   const rateLimiter = new RateLimiter(5, 60_000)
@@ -189,6 +202,18 @@ export function createWebuiHandler(options: WebuiHandlerOptions): WebuiHandler {
   // Hash the login password at startup (async, but resolves before first auth attempt in practice)
   const passwordReady = initPasswordHash(loginPassword)
 
+  // Google OAuth flow store (for PKCE code_verifier → state mapping)
+  const googleFlowStore = new GoogleAuthFlowStore()
+
+  // Database access for user management
+  let userRepo: UserRepository | null = null
+  function getUserRepo(): UserRepository {
+    if (!userRepo) {
+      userRepo = new UserRepository(getDatabase())
+    }
+    return userRepo
+  }
+
   /** Extract client IP — only trusts proxy headers when trustedProxies is configured. */
   function getClientIp(req: Request): string {
     if (trustedProxySet.size > 0) {
@@ -197,6 +222,13 @@ export function createWebuiHandler(options: WebuiHandlerOptions): WebuiHandler {
         ?? 'direct'
     }
     return 'direct'
+  }
+
+  /** Build the absolute server URL from the incoming request. */
+  function getServerUrl(req: Request): string {
+    const proto = getRequestProto(req)
+    const host = getRequestHost(req) ?? '127.0.0.1'
+    return `${proto}://${host}`
   }
 
   async function fetch(req: Request): Promise<Response> {
@@ -209,6 +241,14 @@ export function createWebuiHandler(options: WebuiHandlerOptions): WebuiHandler {
       const health = getHealthCheck()
       return Response.json(health, {
         status: health.status === 'ok' ? 200 : 503,
+      })
+    }
+
+    // ── Auth providers info (no auth) ──
+    if (path === '/api/auth/providers' && req.method === 'GET') {
+      return Response.json({
+        google: !!googleAuthConfig,
+        password: true,
       })
     }
 
@@ -234,7 +274,126 @@ export function createWebuiHandler(options: WebuiHandlerOptions): WebuiHandler {
       return new Response('Not Found', { status: 404 })
     }
 
-    // ── Auth endpoint ──
+    // ── Google OAuth: initiate ──
+    if (path === '/api/auth/google' && req.method === 'GET') {
+      if (!googleAuthConfig) {
+        return Response.json({ error: 'Google OAuth not configured' }, { status: 404 })
+      }
+
+      const config: GoogleAuthConfig = {
+        ...googleAuthConfig,
+        redirectUri: `${getServerUrl(req)}/api/auth/google/callback`,
+      }
+
+      try {
+        const { url: authUrl, state, codeVerifier } = await generateAuthUrl(config)
+        googleFlowStore.store(state, codeVerifier)
+        return Response.redirect(authUrl, 302)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to generate auth URL'
+        logger.error(`[webui] Google auth URL generation failed: ${msg}`)
+        return Response.json({ error: 'Failed to initiate Google authentication' }, { status: 500 })
+      }
+    }
+
+    // ── Google OAuth: callback ──
+    if (path === '/api/auth/google/callback' && req.method === 'GET') {
+      if (!googleAuthConfig) {
+        return Response.json({ error: 'Google OAuth not configured' }, { status: 404 })
+      }
+
+      const code = url.searchParams.get('code')
+      const state = url.searchParams.get('state')
+      const error = url.searchParams.get('error')
+      const errorDescription = url.searchParams.get('error_description')
+
+      if (error) {
+        const errorMsg = errorDescription || error
+        logger.warn(`[webui] Google OAuth callback error: ${errorMsg}`)
+        return new Response(
+          generateCallbackPage({ title: 'Sign-in Failed', isSuccess: false, errorDetail: errorMsg }),
+          { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } },
+        )
+      }
+
+      if (!code || !state) {
+        return new Response(
+          generateCallbackPage({ title: 'Sign-in Failed', isSuccess: false, errorDetail: 'Missing code or state parameter' }),
+          { status: 400, headers: { 'Content-Type': 'text/html; charset=utf-8' } },
+        )
+      }
+
+      const flow = googleFlowStore.get(state)
+      if (!flow) {
+        return new Response(
+          generateCallbackPage({ title: 'Sign-in Failed', isSuccess: false, errorDetail: 'OAuth flow expired or invalid state' }),
+          { status: 400, headers: { 'Content-Type': 'text/html; charset=utf-8' } },
+        )
+      }
+      googleFlowStore.remove(state)
+
+      try {
+        const config: GoogleAuthConfig = {
+          ...googleAuthConfig,
+          redirectUri: `${getServerUrl(req)}/api/auth/google/callback`,
+        }
+
+        const tokens = await exchangeCodeForTokens(config, code, flow.codeVerifier)
+        const googleUser = await verifyIdToken(tokens.idToken, config.clientId)
+
+        // Domain restriction check
+        if (!validateDomain(googleUser.email, googleUser.hd, config.allowedDomain)) {
+          logger.warn(`[webui] Google OAuth domain rejected: ${googleUser.email} (hd=${googleUser.hd})`)
+          return new Response(
+            generateCallbackPage({ title: 'Sign-in Failed', isSuccess: false, errorDetail: 'Your email domain is not authorized' }),
+            { status: 403, headers: { 'Content-Type': 'text/html; charset=utf-8' } },
+          )
+        }
+
+        const repo = getUserRepo()
+        let user = repo.findByGoogleSub(googleUser.sub)
+
+        if (user) {
+          // Existing user — update last login
+          if (!user.isActive) {
+            logger.warn(`[webui] Deactivated user attempted login: ${user.email}`)
+            return new Response(
+              generateCallbackPage({ title: 'Sign-in Failed', isSuccess: false, errorDetail: 'Account is deactivated' }),
+              { status: 403, headers: { 'Content-Type': 'text/html; charset=utf-8' } },
+            )
+          }
+          repo.updateLastLogin(user.id)
+        } else {
+          // New user — first user becomes admin, rest are regular users
+          const isFirstUser = repo.listAll().length === 0
+          user = repo.create({
+            email: googleUser.email,
+            name: googleUser.name,
+            avatarUrl: googleUser.picture,
+            googleSub: googleUser.sub,
+            role: isFirstUser ? 'admin' : 'user',
+            isActive: true,
+          })
+          logger.info(`[webui] Created new user: ${user.email} (role=${user.role})`)
+        }
+
+        const jwt = await createUserSessionToken(secret, user)
+        logger.info(`[webui] Google OAuth login: ${user.email}`)
+
+        return Response.redirect('/', 302, {
+          'Set-Cookie': buildSessionCookie(jwt, useSecureCookies),
+        })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Google authentication failed'
+        logger.error(`[webui] Google OAuth callback failed: ${msg}`)
+        return new Response(
+          generateCallbackPage({ title: 'Sign-in Failed', isSuccess: false, errorDetail: msg }),
+          { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } },
+        )
+      }
+    }
+
+    // ── Password login endpoint (fallback) ──
     if (path === '/api/auth' && req.method === 'POST') {
       await passwordReady
       const ip = getClientIp(req)
@@ -264,7 +423,7 @@ export function createWebuiHandler(options: WebuiHandlerOptions): WebuiHandler {
       }
 
       const jwt = await createSessionToken(secret)
-      logger.info(`[webui] Successful auth from ${ip}`)
+      logger.info(`[webui] Successful password auth from ${ip}`)
 
       return Response.json({ ok: true }, {
         status: 200,
@@ -345,21 +504,50 @@ export function createWebuiHandler(options: WebuiHandlerOptions): WebuiHandler {
       }
     }
 
-    // ── Config endpoint (requires session cookie) ──
-    if (path === '/api/config' && req.method === 'GET') {
-      const configSession = await validateSession(req.headers.get('cookie'), secret)
-      if (!configSession) {
+    // ── Current user endpoint ──
+    if (path === '/api/auth/me' && req.method === 'GET') {
+      const session = await validateSession(req.headers.get('cookie'), secret)
+      if (!session) {
         return Response.json({ error: 'Unauthorized' }, { status: 401 })
       }
+
+      const repo = getUserRepo()
+      const user = repo.findById(session.userId)
+      if (!user) {
+        return Response.json({ error: 'User not found' }, { status: 404 })
+      }
+
+      return Response.json({
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        avatarUrl: user.avatarUrl,
+        role: user.role,
+      })
+    }
+
+    // ── Config endpoint (requires session cookie) ──
+    if (path === '/api/config' && req.method === 'GET') {
+      const session = await validateSession(req.headers.get('cookie'), secret)
+      if (!session) {
+        return Response.json({ error: 'Unauthorized' }, { status: 401 })
+      }
+
+      const repo = getUserRepo()
+      const user = repo.findById(session.userId)
+
       return Response.json({
         wsUrl: resolveWebSocketUrl(req, { publicWsUrl, wsProtocol, wsPort }),
+        user: user
+          ? { id: user.id, email: user.email, name: user.name, role: user.role }
+          : null,
       })
     }
 
     // Return the default workspace ID so the webui can include it in the WS handshake
     if (path === '/api/config/workspaces' && req.method === 'GET') {
-      const configSession = await validateSession(req.headers.get('cookie'), secret)
-      if (!configSession) {
+      const session = await validateSession(req.headers.get('cookie'), secret)
+      if (!session) {
         return Response.json({ error: 'Unauthorized' }, { status: 401 })
       }
       const { getActiveWorkspace } = await import('@craft-agent/shared/config/storage')
@@ -404,7 +592,10 @@ export function createWebuiHandler(options: WebuiHandlerOptions): WebuiHandler {
 
   return {
     fetch,
-    dispose: () => clearInterval(cleanupTimer),
+    dispose: () => {
+      clearInterval(cleanupTimer)
+      googleFlowStore.dispose()
+    },
     setOAuthCallbackDeps: (deps: OAuthCallbackDeps) => {
       options.oauthCallbackDeps = deps
     },

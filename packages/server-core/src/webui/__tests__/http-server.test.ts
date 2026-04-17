@@ -29,6 +29,12 @@ async function createServer(overrides?: {
   publicWsUrl?: string
   wsProtocol?: 'ws' | 'wss'
   wsPort?: number
+  googleAuthConfig?: {
+    clientId: string
+    clientSecret: string
+    redirectUri: string
+    allowedDomain?: string
+  }
 }) {
   const server = await startWebuiHttpServer({
     port: 0,
@@ -41,6 +47,7 @@ async function createServer(overrides?: {
     wsPort: overrides?.wsPort ?? 9100,
     getHealthCheck: () => ({ status: 'ok' }),
     logger,
+    googleAuthConfig: overrides?.googleAuthConfig,
   })
 
   SERVERS.push(server)
@@ -90,9 +97,9 @@ describe('startWebuiHttpServer', () => {
     })
 
     expect(configRes.status).toBe(200)
-    expect(await configRes.json()).toEqual({
-      wsUrl: 'wss://127.0.0.1:9100',
-    })
+    const config = await configRes.json()
+    expect(config.wsUrl).toBe('wss://127.0.0.1:9100')
+    expect(config.user).toBeNull() // no user in DB for legacy password auth
   })
 
   it('rejects invalid credentials', async () => {
@@ -159,9 +166,8 @@ describe('startWebuiHttpServer', () => {
     })
 
     expect(configRes.status).toBe(200)
-    expect(await configRes.json()).toEqual({
-      wsUrl: 'wss://craft.example.com:9100',
-    })
+    const config = await configRes.json()
+    expect(config.wsUrl).toBe('wss://craft.example.com:9100')
   })
 
   it('returns an explicit public websocket URL override from /api/config', async () => {
@@ -184,8 +190,126 @@ describe('startWebuiHttpServer', () => {
     })
 
     expect(configRes.status).toBe(200)
-    expect(await configRes.json()).toEqual({
-      wsUrl: 'wss://craft.example.com/ws',
+    const config = await configRes.json()
+    expect(config.wsUrl).toBe('wss://craft.example.com/ws')
+  })
+})
+
+describe('/api/auth/providers', () => {
+  it('returns google=false when not configured', async () => {
+    const { baseUrl } = await createServer()
+
+    const res = await fetch(`${baseUrl}/api/auth/providers`)
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual({ google: false, password: true })
+  })
+
+  it('returns google=true when configured', async () => {
+    const { baseUrl } = await createServer({
+      googleAuthConfig: {
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+        redirectUri: 'http://localhost/callback',
+      },
     })
+
+    const res = await fetch(`${baseUrl}/api/auth/providers`)
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual({ google: true, password: true })
+  })
+})
+
+describe('/api/auth/google', () => {
+  it('returns 404 when Google auth is not configured', async () => {
+    const { baseUrl } = await createServer()
+
+    const res = await fetch(`${baseUrl}/api/auth/google`, { redirect: 'manual' })
+    expect(res.status).toBe(404)
+  })
+
+  it('redirects to Google when configured', async () => {
+    const { baseUrl } = await createServer({
+      googleAuthConfig: {
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+        redirectUri: 'http://localhost/callback',
+      },
+    })
+
+    const res = await fetch(`${baseUrl}/api/auth/google`, { redirect: 'manual' })
+    expect(res.status).toBe(302)
+    const location = res.headers.get('location')
+    expect(location).toBeTruthy()
+    expect(location).toContain('accounts.google.com')
+    expect(location).toContain('client_id=test-client-id')
+    expect(location).toContain('response_type=code')
+    expect(location).toContain('code_challenge=')
+    expect(location).toContain('code_challenge_method=S256')
+    expect(location).toContain('scope=openid+email+profile')
+  })
+})
+
+describe('/api/auth/google/callback', () => {
+  it('returns 404 when Google auth is not configured', async () => {
+    const { baseUrl } = await createServer()
+
+    const res = await fetch(`${baseUrl}/api/auth/google/callback?code=abc&state=xyz`)
+    expect(res.status).toBe(404)
+  })
+
+  it('renders error page for missing code/state', async () => {
+    const { baseUrl } = await createServer({
+      googleAuthConfig: {
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+        redirectUri: 'http://localhost/callback',
+      },
+    })
+
+    const res = await fetch(`${baseUrl}/api/auth/google/callback`)
+    expect(res.status).toBe(400)
+    const text = await res.text()
+    expect(text).toContain('Missing code or state parameter')
+  })
+
+  it('renders error page for invalid/expired state', async () => {
+    const { baseUrl } = await createServer({
+      googleAuthConfig: {
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+        redirectUri: 'http://localhost/callback',
+      },
+    })
+
+    const res = await fetch(`${baseUrl}/api/auth/google/callback?code=abc&state=invalid-state`)
+    expect(res.status).toBe(400)
+    const text = await res.text()
+    expect(text).toContain('OAuth flow expired or invalid state')
+  })
+})
+
+describe('/api/auth/me', () => {
+  it('returns 401 without session', async () => {
+    const { baseUrl } = await createServer()
+
+    const res = await fetch(`${baseUrl}/api/auth/me`)
+    expect(res.status).toBe(401)
+  })
+
+  it('returns 404 for legacy password session (no user in DB)', async () => {
+    const { baseUrl } = await createServer()
+
+    const authRes = await fetch(`${baseUrl}/api/auth`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: PASSWORD }),
+    })
+
+    const res = await fetch(`${baseUrl}/api/auth/me`, {
+      headers: { cookie: extractSessionCookie(authRes) },
+    })
+    expect(res.status).toBe(404)
   })
 })

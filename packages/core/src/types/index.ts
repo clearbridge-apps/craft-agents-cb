@@ -56,6 +56,9 @@ export { generateMessageId } from './message.ts';
 // Message persistence mappers
 export { messageToStored, storedToMessage } from './message-mapper.ts';
 
+// User types
+export type { UserRole, User, WorkspaceMember } from './user.ts';
+
 // Server types (headless operations)
 export type {
   ServerStatus,

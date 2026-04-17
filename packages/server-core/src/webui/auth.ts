@@ -8,6 +8,7 @@
  */
 
 import { SignJWT, jwtVerify } from 'jose'
+import type { User } from '@craft-agent/core/types'
 
 // ---------------------------------------------------------------------------
 // JWT helpers (via jose library)
@@ -16,14 +17,20 @@ import { SignJWT, jwtVerify } from 'jose'
 const JWT_EXPIRY_SECONDS = 86_400 // 24 hours
 
 export interface JwtPayload {
-  sub: string
+  sub: string // userId
+  email: string
+  role: string
   iat: number
   exp: number
 }
 
 export async function signJwt(payload: JwtPayload, secret: string): Promise<string> {
   const key = new TextEncoder().encode(secret)
-  return new SignJWT({ sub: payload.sub } as Record<string, unknown>)
+  return new SignJWT({
+    sub: payload.sub,
+    email: payload.email,
+    role: payload.role,
+  } as Record<string, unknown>)
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt(payload.iat)
     .setExpirationTime(payload.exp)
@@ -36,6 +43,8 @@ export async function verifyJwt(token: string, secret: string): Promise<JwtPaylo
     const { payload } = await jwtVerify(token, key, { algorithms: ['HS256'] })
     return {
       sub: payload.sub as string,
+      email: payload.email as string,
+      role: payload.role as string,
       iat: payload.iat as number,
       exp: payload.exp as number,
     }
@@ -44,9 +53,22 @@ export async function verifyJwt(token: string, secret: string): Promise<JwtPaylo
   }
 }
 
+/** Legacy session token for password fallback (sub = 'webui'). */
 export async function createSessionToken(secret: string): Promise<string> {
   const now = Math.floor(Date.now() / 1000)
-  return signJwt({ sub: 'webui', iat: now, exp: now + JWT_EXPIRY_SECONDS }, secret)
+  return signJwt(
+    { sub: 'webui', email: 'webui@local', role: 'admin', iat: now, exp: now + JWT_EXPIRY_SECONDS },
+    secret,
+  )
+}
+
+/** User-aware session token for Google OAuth login. */
+export async function createUserSessionToken(secret: string, user: User): Promise<string> {
+  const now = Math.floor(Date.now() / 1000)
+  return signJwt(
+    { sub: user.id, email: user.email, role: user.role, iat: now, exp: now + JWT_EXPIRY_SECONDS },
+    secret,
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -177,11 +199,19 @@ export class RateLimiter {
 // Session validator (used by both HTTP and WebSocket)
 // ---------------------------------------------------------------------------
 
+export interface SessionInfo {
+  userId: string
+  email: string
+  role: string
+}
+
 export async function validateSession(
   cookieHeader: string | null,
   secret: string,
-): Promise<JwtPayload | null> {
+): Promise<SessionInfo | null> {
   const token = extractSessionCookie(cookieHeader)
   if (!token) return null
-  return verifyJwt(token, secret)
+  const payload = await verifyJwt(token, secret)
+  if (!payload) return null
+  return { userId: payload.sub, email: payload.email, role: payload.role }
 }

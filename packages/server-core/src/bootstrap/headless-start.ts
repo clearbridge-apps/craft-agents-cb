@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { OAuthFlowStore } from '@craft-agent/shared/auth'
 import { ensureConfigDir, loadStoredConfig, saveConfig } from '@craft-agent/shared/config'
 import { CONFIG_DIR } from '@craft-agent/shared/config/paths'
+import { getDatabase } from '@craft-agent/shared/database'
 import { setBundledAssetsRoot } from '@craft-agent/shared/utils'
 import { WsRpcServer, type WsRpcTlsOptions } from '../transport/server'
 import type { EventSink, RpcServer } from '../transport/types'
@@ -248,6 +249,26 @@ function ensureGlobalConfigExists(platform: PlatformServices): void {
   platform.logger.info('[bootstrap] Initialized missing global config')
 }
 
+// ---------------------------------------------------------------------------
+// Database initialization
+// ---------------------------------------------------------------------------
+
+function initializeDatabase(platform: PlatformServices): void {
+  try {
+    const db = getDatabase()
+    platform.logger.info('[bootstrap] Database initialized')
+    // Verify the connection is healthy
+    const result = db.query('SELECT 1').get()
+    if (result) {
+      platform.logger.info('[bootstrap] Database connection verified')
+    }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
+    platform.logger.error(`[bootstrap] Database initialization failed: ${msg}`)
+    throw new Error(`Failed to initialize database: ${msg}`)
+  }
+}
+
 export async function bootstrapServer<TSessionManager, THandlerDeps>(
   options: ServerBootstrapOptions<TSessionManager, THandlerDeps>,
 ): Promise<ServerInstance<TSessionManager>> {
@@ -276,6 +297,7 @@ export async function bootstrapServer<TSessionManager, THandlerDeps>(
 
   bootstrapConfigArtifacts(platform)
   ensureGlobalConfigExists(platform)
+  initializeDatabase(platform)
   acquireServerLock(platform.logger)
 
   const modelRefreshService = options.initModelRefreshService()
